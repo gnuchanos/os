@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+log() { printf '==> xlibre: %s\n' "$1"; }
+die() { printf '==> xlibre: %s\n' "$1" >&2; exit 1; }
+
+INSTALLER=/opt/gnuchanos/dotfile/XLIBRE/Install_xlibre.py
+[ -f "$INSTALLER" ] || die "the XLibre installer was not staged: $INSTALLER"
+command -v python3 >/dev/null 2>&1 || die "python3 is required to install XLibre"
+ARCH="$(dpkg --print-architecture)"
+case "$ARCH" in
+    amd64|arm64) ;;
+    *) die "XLibre is not published for $ARCH; refusing to build an Xorg image" ;;
+esac
+
+log "installing XLibre from its signed Debian repository"
+python3 "$INSTALLER" || die "XLibre installation failed; refusing to build an Xorg image"
+
+if ! dpkg-query -W -f='${Status}' xlibre 2>/dev/null |
+     grep -q '^install ok installed$'; then
+    die "the xlibre package is not installed; refusing to build an Xorg image"
+fi
+
+if dpkg-query -W -f='${Status}' xserver-xorg-core 2>/dev/null |
+   grep -q '^install ok installed$'; then
+    die "xserver-xorg-core is still installed; refusing to build an Xorg image"
+fi
+
+log "XLibre is installed and Xorg is absent"

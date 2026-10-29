@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+
+log() { printf '==> xlibre-32bit: %s\n' "$1"; }
+die() { printf '==> xlibre-32bit: %s\n' "$1" >&2; exit 1; }
+SRC=/opt/gnuchanos/x11libre-xserver
+
+if [ ! -d "$SRC" ]; then
+    log "no $SRC; XLibre is not installed by this image"
+    exit 0
+fi
+
+# Only run for 32-bit builds
+ARCH=$(dpkg --print-architecture 2>/dev/null || echo "unknown")
+if [ "$ARCH" != "i386" ]; then
+    log "not a 32-bit build, skipping"
+    exit 0
+fi
+
+# Get distribution from /etc/os-release or use bookworm as default
+DISTRIBUTION=$(grep -oP '(?<=VERSION_CODENAME=).+' /etc/os-release 2>/dev/null || echo "bookworm")
+
+log "installing 32-bit XLibre build dependencies for $DISTRIBUTION"
+DEBIAN_FRONTEND=noninteractive
+export DEBIAN_FRONTEND
+apt-get update -o Acquire::Retries=3 >/dev/null 2>&1 || true
+
+# For 32-bit builds, we need to add i386 architecture
+dpkg --add-architecture i386 2>/dev/null || true
+
+# Try to add AntiX repositories for better 32-bit package support
+log "adding AntiX repositories for 32-bit package support"
+cat > /etc/apt/sources.list.d/antix.list << EOF
+# AntiX repositories for 32-bit package support
+deb http://repo.antixlinux.com/$DISTRIBUTION $DISTRIBUTION main nosystemd
+EOF
+
+# Import AntiX GPG key
+apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 0A2C7B0301C1B6A5 2>/dev/null || true
+
+apt-get update
+
+# Try to install development packages for 32-bit
+# First try with 32-bit packages
+apt-get install -y --no-install-recommends \
+    meson ninja-build pkg-config \
+    xcb-proto \
+    libxcb1-dev:i386 libxau-dev:i386 libxdmcp-dev:i386 \
+    libxext-dev:i386 libxfixes-dev:i386 libxi-dev:i386 libxinerama-dev:i386 \
+    libxrender-dev:i386 libxrandr-dev:i386 libxss-dev:i386 libxv-dev:i386 \
+    libxkbfile-dev:i386 libxfont-dev:i386 libpixman-1-dev:i386 libdrm-dev:i386 \
+    libxcvt-dev:i386 libxshmfence-dev:i386 libssl-dev:i386 libgcrypt-dev:i386 \
+    libepoxy-dev:i386 libudev-dev:i386 libdbus-1-dev:i386 \
+    libsystemd-dev \
+    || { log "could not install 32-bit XLibre build dependencies; trying 64-bit versions"; \
+         apt-get install -y --no-install-recommends \
+            meson ninja-build pkg-config \
+            xcb-proto \
+            libxcb1-dev libxau-dev libxdmcp-dev \
+            libxext-dev libxfixes-dev libxi-dev libxinerama-dev \
+            libxrender-dev libxrandr-dev libxss-dev libxv-dev \
+            libxkbfile-dev libxfont-dev libpixman-1-dev libdrm-dev \
+            libxcvt-dev libxshmfence-dev libssl-dev libgcrypt-dev \
+            libepoxy-dev libudev-dev libdbus-1-dev \
+            libsystemd-dev \
+            xorg-dev \
+            || { log "could not install XLibre build dependencies; skipping"; exit 0; } }
+
+log "building XLibre from source for 32-bit"
+(
+    cd "$SRC"
+    # Patch version requirements for AntiX/Bookworm compatibility
+    if [ -f "meson.build" ]; then
+        log "patching version requirements for 32-bit compatibility"
+        # fixesproto: AntiX/Bookworm has 6.0, XLibre requires >= 6.1
+        sed -i 's/fixesproto >= 6\.1/fixesproto >= 6.0/' meson.build 2>/dev/null || true
+        sed -i 's/"fixesproto", version: ">=6\.1"/"fixesproto", version: ">=6.0"/' meson.build 2>/dev/null || true
+        sed -i 's/dependency.*fixesproto.*version.*>=.*6\.1/dependency("fixesproto", version: ">=6.0")/' meson.build 2>/dev/null || true
+        sed -i 's/version: .*6\.1.*fixesproto/version: ">=6.0"/' meson.build 2>/dev/null || true
+        
+        # Handle other potential version mismatches
+        # xorgproto: AntiX might have different versions
+        sed -i 's/xorgproto >= [0-9][0-9]*\.[0-9]/xorgproto >= 2022.2/' meson.build 2>/dev/null || true
+        sed -i 's/"xorgproto", version: ">=.*"/"xorgproto", version: ">=2022.2"/' meson.build 2>/dev/null || true
+        
+        # xcb: Be more lenient with xcb version requirements
+        sed -i 's/xcb >= [0-9][0-9]*\.[0-9]/xcb >= 1.15/' meson.build 2>/dev/null || true
+    fi
+    # Also check subdirectories for meson.build files
+    find . -name "meson.build" -type f -exec sed -i 's/fixesproto >= 6\.1/fixesproto >= 6.0/g' {} \; 2>/dev/null || true
+    find . -name "meson.build" -type f -exec sed -i 's/"fixesproto", version: ">=6\.1"/"fixesproto", version: ">=6.0"/g' {} \; 2>/dev/null || true
+    
+    # For 32-bit builds, we might need to set some meson options
+    meson setup build --prefix=/usr -Dxnest=false -Dxvfb=false
+    ninja -C build install
+)
+
+log "32-bit XLibre build done"

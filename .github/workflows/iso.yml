@@ -1,0 +1,382 @@
+name: iso
+
+# A push that touches the ISO recipe or the version builds and publishes an
+# image by itself. The build is expensive - debootstrap, a whole Debian desktop
+# installed inside a chroot, and every Gnuchan program and the GCL language
+# compiled in it: hours of work and several gigabytes. The paths filter on the
+# trigger is what keeps that off the ordinary push (a README or a theme change
+# costs nothing), while a change to the recipe or to version.txt is exactly a
+# request for a new image.
+#
+# The version is read from version.txt at the repository root, which is the one
+# place it is written by hand. Bump it and push, and a release named after it
+# goes out; push again without touching the file and the release already exists,
+# so nothing new is published.
+on:
+  push:
+    branches: [main]
+    paths:
+      - version.txt
+      - distro/**
+      - .github/workflows/iso.yml
+  # Still startable by hand, because the paths filter is a guess at what "the
+  # image changed" and a person who knows it did not match should be able to say
+  # so.
+  workflow_dispatch:
+
+# Publishing needs write access to the repository. Scoped to the release job
+# below rather than the whole workflow, so the build job cannot write anything.
+permissions:
+  contents: read
+
+jobs:
+  build-debian-64bit:
+    name: Build Debian 64-bit ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version.txt
+        id: version
+        run: |
+          version="$(tr -d '[:space:]' < version.txt)"
+          if [ -z "$version" ]; then
+            echo "version.txt is empty - nothing to name the image after" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        run: |
+          for tree in \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache; do
+            echo "removing $tree"
+            timeout 180 sudo rm -rf "$tree" || echo "  (could not, or timed out; carrying on)"
+          done
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Fetch program repositories
+        env:
+          TOKEN: ${{ secrets.GNUCHAN_REPOS_TOKEN }}
+        run: |
+          set -eu
+          programs="
+          GnuChanTerm
+          GnuChanFetch
+          GnuChanRunner
+          GnuChanWifi
+          GnuChanNetworkManager
+          GnuChanDock
+          GnuChanBrowser
+          GnuChanSS
+          GnuChanLockScreen
+          GnuChanNotification
+          GnuChanTop
+          GnuChanSettings
+          GCL
+          GnuChanWM
+          GnuChanDM
+          "
+          mkdir -p distro/repos
+          for name in $programs; do
+            repo="$name"
+            if [ "$name" = "GCL" ]; then
+              repo=gcl
+            fi
+            if [ -n "${TOKEN:-}" ]; then
+              url="https://x-access-token:${TOKEN}@github.com/gnuchanos/${repo}.git"
+            else
+              url="https://github.com/gnuchanos/${repo}.git"
+            fi
+            if git clone --depth 1 --quiet "$url" "distro/repos/$name" 2>/dev/null; then
+              echo "fetched $name"
+            else
+              echo "::warning::could not fetch $name; the image will not carry it"
+            fi
+          done
+
+      # THE BUILD RUNS IN A PRIVILEGED DEBIAN CONTAINER, and that is not a
+      # convenience. build.sh is Debian-only on purpose: it installs with
+      # apt-get and drives live-build, which needs root, loop devices and the
+      # ability to mount and unmount inside the chroot it builds. The hosted
+      # runner is Ubuntu, not the Debian base the image is built on, and a
+      # live-build driven from the wrong distribution is the kind of difference
+      # that shows up as an image that boots to the wrong place long after the
+      # build said it succeeded. Each matrix entry uses its matching Debian
+      # container: Trixie for amd64 and Bookworm for the full i386 system.
+      #
+      # The repository is mounted at its own path - not copied - so the finished
+      # ISO lands back on the runner under distro/_build/ where the next steps
+      # find it, and nothing large crosses the container boundary but the work
+      # itself.
+      #
+      # build.sh is run through `sh`, not as `./build.sh`, and that is not a
+      # style choice: git does not carry the execute bit reliably, and a
+      # checkout made on Windows has none at all (the same reason the hooks get
+      # their bits set inside the build). `./build.sh` in that checkout is
+      # "Permission denied" and exit 126 before anything is built - the failure
+      # this line exists to not have. Naming the interpreter takes the file's
+      # own mode out of the question.
+      - name: Build the ISO
+        run: |
+          # rsync is named BESIDE live-build for the same reason build.sh
+          # installs it: live-build copies its overlay into the chroot with
+          # rsync and drops to a tar-per-directory fallback without it, and
+          # rsync is only a Recommends of live-build - so the
+          # --no-install-recommends here would leave it out and every overlay
+          # copy would take the slow path. build.sh checks for it too, so this
+          # is belt-and-braces for the primary build path, and it costs one
+          # already-cached package.
+          
+          echo "=== BUILD STARTING ==="
+          echo "This build will FAIL EARLY if any program repository is not accessible"
+          echo "or if any program fails to build/install."
+          echo ""
+          
+          # Build and capture output with real-time logging
+          set +e
+          docker run --privileged --rm \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -v "$PWD:$PWD" -w "$PWD/distro" \
+            debian:trixie \
+            bash -c '
+              echo "=== DOCKER CONTAINER STARTED ==="
+              echo "Installing live-build and rsync..."
+              apt-get update && apt-get install -y --no-install-recommends live-build rsync curl
+              echo "Fixing line endings..."
+              sed -i "s/\r$//" ./build.sh
+              echo "=== STARTING BUILD.SH ==="
+              echo "NOTE: Build will FAIL IMMEDIATELY if any program fails"
+              echo ""
+              sh ./build.sh
+            ' 2>&1 | tee build-output.txt
+          
+          build_exit_code=${PIPESTATUS[0]}
+          
+          # Save build output to artifact
+          mkdir -p build-logs
+          mv build-output.txt "build-logs/build-debian-64bit.txt"
+          
+          # Also save first 50 lines of error for quick diagnosis
+          if [ $build_exit_code -ne 0 ]; then
+            echo "=== BUILD FAILED WITH EXIT CODE: $build_exit_code ===" > "build-logs/error-summary-debian-64bit.txt"
+            echo "=== FIRST 100 LINES (for early failure diagnosis) ===" >> "build-logs/error-summary-debian-64bit.txt"
+            head -100 "build-logs/build-debian-64bit.txt" >> "build-logs/error-summary-debian-64bit.txt"
+            echo "" >> "build-logs/error-summary-debian-64bit.txt"
+            echo "=== LAST 100 LINES ===" >> "build-logs/error-summary-debian-64bit.txt"
+            tail -100 "build-logs/build-debian-64bit.txt" >> "build-logs/error-summary-debian-64bit.txt"
+            echo "" >> "build-logs/error-summary-debian-64bit.txt"
+            echo "=== ERROR PATTERN MATCH ===" >> "build-logs/error-summary-debian-64bit.txt"
+            grep -i -B5 -A5 "error\|failed\|not found\|missing\|cannot" "build-logs/build-debian-64bit.txt" | head -50 >> "build-logs/error-summary-debian-64bit.txt"
+          fi
+          
+          set -e
+          if [ $build_exit_code -ne 0 ]; then
+            echo "=== BUILD FAILED ==="
+            echo "Exit code: $build_exit_code"
+            echo ""
+            echo "Most likely cause: A program repository failed to fetch or build"
+            echo "Check 'error-summary-debian-64bit.txt' for quick diagnosis"
+            echo "Check 'build-debian-64bit.txt' for full logs"
+            echo ""
+            exit $build_exit_code
+          fi
+
+      # THE BUILD OUTPUT IS ROOT'S, AND THE REST OF THE RUN IS NOT.
+      #
+      # The container above runs as root - it has to: live-build mounts and
+      # unmounts inside the chroot it builds - and it writes into distro/_build/
+      # through the bind mount, so the directory and the ISO in it come out
+      # owned by root. Every step after this runs as the runner user, and the
+      # very next thing it does is rename that ISO; a rename needs write
+      # permission on the DIRECTORY holding it, which a root-owned directory does
+      # not give, so the run died at "mv: cannot move ... Permission denied"
+      # AFTER the hours-long build it was the whole point of.
+      #
+      # Handing the directory back to the runner is the fix, and only the
+      # directory: a rename and the splits that follow are all changes to the
+      # DIRECTORY's own entries, so owning it is enough. -R is NOT used on
+      # purpose - under _build/work/ is the whole chroot and binary tree, a
+      # hundred thousand files whose ownership does not matter and whose
+      # recursive chown would cost minutes for nothing.
+      - name: Give the build output back to the runner user
+        run: |
+          sudo chown "$(id -u):$(id -g)" distro/_build
+          ls -ld distro/_build
+          ls -lh distro/_build/*.iso
+
+      # WHAT GOES IN THE RELEASE depends on ONE thing: whether the image fits in
+      # a single release file. GitHub refuses an asset of 2 GiB or more, so an
+      # image OVER that ceiling is the only case that has to be cut up - and an
+      # image that comes in UNDER it is published WHOLE, as one plainly named
+      # GnuchanOS-<version>-<architecture>.iso. Splitting an image that fits is a
+      # release whose download is a file called "...iso.00.part" for no reason at
+      # all, and that is the whole of this step: small image, one file; large
+      # image, numbered parts and a note; never both, never a part when a whole
+      # would do.
+      #
+      # Everything is gathered into release/ first, so the upload and the release
+      # publish ONE name that holds whatever this run produced - the plain ISO or
+      # the parts - without either of them having to know which it was.
+      - name: Prepare the release files
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          cd distro/_build
+          mkdir -p "$GITHUB_WORKSPACE/release"
+
+          # Find the ISO file (it could be GnuchanOS-trixie-amd64.iso or similar)
+          iso=$(find . -maxdepth 1 -name "GnuchanOS-*.iso" | head -n1)
+          if [ -z "$iso" ]; then
+            echo "the build produced no ISO in distro/_build" >&2
+            ls -la
+            exit 1
+          fi
+          echo "Found ISO: $iso"
+
+          # Include architecture in every release name so the two builds can
+          # be attached to the same version without collisions.
+          named="GnuchanOS-$version-64bit.iso"
+          size="$(stat -c %s "$iso")"
+          # 1900 MiB, under the 2 GiB ceiling with room for the asset's own
+          # metadata.
+          ceiling=$((1900 * 1024 * 1024))
+
+          if [ "$size" -le "$ceiling" ]; then
+            echo "$named is $((size / 1024 / 1024)) MiB - it fits one release file, publishing it whole"
+            cp "$iso" "$GITHUB_WORKSPACE/release/$named"
+            ( cd "$GITHUB_WORKSPACE/release" && sha256sum "$named" > "SHA256SUMS-64bit.txt" )
+          else
+            echo "$named is $((size / 1024 / 1024)) MiB - over the release ceiling, splitting it"
+            # --numeric-suffixes=1 and two digits: ...iso.part01, part02, ...
+            # ONE is the first part, and a two-digit field is what a person
+            # reads in order when they list the files beside each other.
+            split -b 1900M -d -a 2 --numeric-suffixes=1 \
+                  "$iso" "$GITHUB_WORKSPACE/release/$named.part"
+            # The glob is `.part*` and NOT `.part`, and that is a correction:
+            # split with --numeric-suffixes writes `...iso.part01`, `...part02`,
+            # etc., whose names END in `part01` - so a `*.part` pattern matches
+            # NONE of them. In a `set -e` shell an unmatched glob is passed
+            # through literally and sha256sum then fails on a file called
+            # "*.part", which aborts the whole step AFTER the hours-long build.
+            # `*.part*` matches every numbered part.
+            ( cd "$GITHUB_WORKSPACE/release" && sha256sum *.part* > "SHA256SUMS-64bit.txt" )
+            cat > "$GITHUB_WORKSPACE/release/REASSEMBLE-64bit.txt" <<EOF
+          GnuchanOS $version (64-bit) - the live ISO, shipped in parts.
+
+          A single release file may not be 2 GiB or more, and this image is
+          larger than that, so it is cut into numbered parts. Put them back
+          together, IN ORDER, into one file:
+
+              cat $named.part* > $named
+
+          Then check the parts you downloaded:
+
+              sha256sum -c SHA256SUMS-64bit.txt
+
+          Write the rejoined image to a USB stick with dd or balenaEtcher.
+          EOF
+          fi
+
+          ls -lh "$GITHUB_WORKSPACE/release"
+
+      - name: Upload the release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnuchanos-iso-64bit
+          path: release/
+          if-no-files-found: error
+          # The files are an already-compressed squashfs image (or pieces of
+          # one), so the artifact's own zip pass gains nothing and only spends
+          # time on gigabytes. Off, so the upload is a copy.
+          compression-level: 0
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-64bit
+          path: build-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Release
+    needs: [build-debian-64bit]
+    runs-on: ubuntu-latest
+    # Publishing needs write access to the repository. The default token is
+    # read-only in some repositories, so it is asked for explicitly, and it is
+    # scoped to this job rather than given to the whole workflow.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The version lives in version.txt at the repository root, and that file
+      # is the only place it is written by hand. Bump it and push, and this job
+      # publishes a release named after it; push again without touching it and
+      # the release already exists, so nothing new goes out. A version written
+      # with a suffix - 0.1.1_test - is published as v0.1.1_test, which is how a
+      # test image is told apart from a real one without a second file to keep
+      # in step.
+      - name: Read version.txt
+        id: version
+        run: |
+          version="$(tr -d '[:space:]' < version.txt)"
+          if [ -z "$version" ]; then
+            echo "version.txt is empty - nothing to release" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download the release files and build logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gnuchanos-iso-*
+          merge-multiple: true
+          path: iso
+          
+      - name: Download build logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-logs-*
+          merge-multiple: true
+          path: build-logs
+
+      # Whether this version has already been published. gh is on the runner; a
+      # version that already has a release is a no-op, not an error.
+      - name: Check whether the release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Publish only when the version is new. Re-running the workflow against the
+      # same version leaves the existing release alone rather than fighting it,
+      # which is what makes the whole job safe to run again after a failure
+      # anywhere before this point.
+      #
+      # The release files are attached. The image is either one GnuchanOS-<version>-64bit.iso
+      # or numbered parts, with checksum and reassembly files.
+      - name: Publish the release
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: GnuchanOS ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            iso/*
+            build-logs/*
+

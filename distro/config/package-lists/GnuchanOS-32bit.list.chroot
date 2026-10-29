@@ -1,0 +1,165 @@
+# GnuchanOS 32-bit - the packages the live image carries.
+# This is for 32-bit builds using AntiX repositories
+
+# --- a bootable live system ---
+live-boot
+live-config
+live-config-systemd
+systemd
+systemd-sysv
+dbus
+
+# --- the boot splash ---
+plymouth
+plymouth-themes
+initramfs-tools
+zstd
+
+# --- GRUB for 32-bit ---
+grub-common
+grub2-common
+grub-pc-bin
+# For 32-bit UEFI (IA32)
+grub-efi-ia32-bin
+
+# --- disk tools ---
+parted
+gdisk
+btrfs-progs
+zram-tools
+xfsprogs
+f2fs-tools
+dosfstools
+efibootmgr
+cryptsetup
+
+# --- the X server's own parts ---
+xkb-data
+x11-xkb-utils
+x11-utils
+x11-xserver-utils
+xauth
+xinit
+keyboard-configuration
+libinput10
+xserver-xorg-input-libinput
+xinput
+libinput-tools
+udev
+libgl1
+libgl1-mesa-dri
+libegl1
+libgbm1
+procps
+pciutils
+usbutils
+
+# --- fonts ---
+xfonts-base
+fonts-dejavu-core
+fonts-dejavu-extra
+fonts-liberation2
+
+# --- the tools the Gnuchan programs are built with ---
+build-essential
+pkg-config
+python3
+python3-setuptools
+ca-certificates
+curl
+gnupg
+git
+rsync
+
+# --- what the programs link against ---
+libx11-dev
+libxft-dev
+libfreetype-dev
+libxcursor-dev
+libimlib2-dev
+libxcomposite-dev
+libxdamage-dev
+libxrender-dev
+libxrandr-dev
+libxss-dev
+libxext-dev
+libxmu-dev
+libxpm-dev
+libpng-dev
+libjpeg-dev
+
+# --- PAM ---
+libpam0g-dev
+libpam-modules
+libpam-runtime
+dbus-x11
+libnotify-bin
+pkexec
+mate-polkit
+libpam-systemd
+dbus-user-session
+polkitd
+
+# --- GnuChanBrowser is a Qt program ---
+qt6-base-dev
+qt6-base-dev-tools
+libqt6widgets6
+libqt6network6
+libqt6webenginewidgets6
+libqt6webenginecore6
+
+# --- networking ---
+network-manager
+wpasupplicant
+wireless-tools
+rfkill
+iputils-ping
+iproute2
+systemd-resolved
+
+# --- firmware for 32-bit ---
+firmware-linux
+firmware-iwlwifi
+firmware-atheros
+firmware-realtek
+firmware-brcm80211
+firmware-ralink
+firmware-misc-nonfree
+firmware-linux-nonfree
+# 32-bit might not need all graphics firmware, but include basic ones
+firmware-amd-graphics
+
+# --- GPU ---
+libvulkan1
+mesa-vulkan-drivers
+
+# --- applications ---
+deluge
+deluge-gtk
+python3-libtorrent
+
+# --- system utilities ---
+alsa-utils
+xterm
+x11-apps
+nano
+sudo
+irqbalance
+ntpsec
+openssh-server
+ufw
+tlp
+tlp-rdw
+
+# --- locale and time ---
+locales
+tzdata
+
+# --- installer dependencies ---
+squashfs-tools
+util-linux
+e2fsprogs
+parted
+dosfstools
+efibootmgr
+initramfs-tools

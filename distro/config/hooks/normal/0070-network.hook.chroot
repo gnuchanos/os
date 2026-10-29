@@ -1,0 +1,649 @@
+#!/bin/sh
+# GnuchanOS - make the network actually work at boot.
+#
+# THE SYMPTOM THIS FILE EXISTS FOR: the wireless link associates, takes a lease,
+# pings the router and the machine beside it - and every NAME lookup fails with
+# "Temporary failure in name resolution". The network works; the resolver does
+# not. Association, an address and a route are the driver's and the lease's job;
+# resolving a name is this file's.
+#
+# WHY IT FAILED EVEN AFTER RESOLVED WAS ENABLED. Name resolution goes through
+# systemd-resolved, which listens on 127.0.0.53 and is reached by making
+# /etc/resolv.conf a symlink to its stub, /run/systemd/resolve/stub-resolv.conf.
+# That symlink cannot be made while the image is built - the stub lives on /run,
+# which is empty in a chroot, and the hooks AFTER this one (0100 apt, 0300 the
+# program fetch) still need a working resolv.conf - so it is made at BOOT by a
+# one-shot service. The earlier version of that service did this:
+#
+#     if [ ! -e "$STUB" ]; then exit 0; fi     # "not there, leave it alone"
+#
+# which is exactly backwards for the case that happens. On a live boot the stub
+# is created a beat AFTER the service is scheduled, so the check can run a
+# moment too early, find nothing, and LEAVE /etc/resolv.conf AS THE BUILD LEFT
+# IT - a nameserver from the machine that built the image, which does not exist
+# on the person's network. Every lookup then asks an address that is not there,
+# and "Temporary failure in name resolution" is what that says.
+#
+# SO THE BOOT SCRIPT NOW WAITS for the stub, and if it genuinely never appears
+# it writes a resolver that WORKS rather than leaving a dead one. Either way
+# /etc/resolv.conf ends the boot pointing somewhere that answers.
+#
+# WHAT ELSE IS SET, AND WHY
+#
+#   1. NetworkManager is enabled, so a connection is brought up with a lease.
+#   2. systemd-resolved is enabled, the resolver the DNS panel drives.
+#   3. NetworkManager hands its DNS to resolved AND IS TOLD NOT TO TOUCH
+#      /etc/resolv.conf (rc-manager=unmanaged). Without that second half NM and
+#      resolved both try to own the file and one overwrites the other - the same
+#      "connected, nothing resolves" from a different direction.
+#   4. resolved is pointed at a public resolver FORCED for every name
+#      (DNS=, Domains=~.), so an ISP resolver that refuses a name by policy is
+#      never the one asked. See section 3b.
+#   5. outgoing DNS is sent to that resolver on a NON-STANDARD PORT by a NAT
+#      rule (section 7), which is what defeats an interception that watches
+#      port 53. zapret covers the port-443 name; this covers the port-53 one.
+#
+# Each step is guarded and reported, so a build missing one package still
+# produces an image and says which part was skipped.
+set -eu
+
+log() { printf '==> network: %s\n' "$1"; }
+
+# --- 0. DNS cozumleme icin /etc/resolv.conf ----------------------------------
+# apt ve git icinde calisan chroot'a calisan bir nameserver lazim,
+# yoksa her fetch "Temporary failure resolving" ile basarisiz olur.
+if [ ! -e /etc/resolv.conf ] || ! grep -q '^nameserver' /etc/resolv.conf; then
+    mkdir -p /etc
+    rm -f /etc/resolv.conf
+    printf '%s\n' \
+        'nameserver 8.8.8.8' \
+        'nameserver 1.1.1.1' > /etc/resolv.conf
+    log "wrote a build-time /etc/resolv.conf (8.8.8.8, 1.1.1.1)"
+fi
+
+# --- 1. NetworkManager -------------------------------------------------------
+
+if systemctl list-unit-files NetworkManager.service >/dev/null 2>&1; then
+    systemctl enable NetworkManager.service >/dev/null 2>&1 || true
+    log "enabled NetworkManager"
+else
+    log "NetworkManager.service is not in this image; the live session will" \
+        "have no manager to bring a connection up"
+fi
+
+# --- 2. systemd-resolved -----------------------------------------------------
+
+RESOLVED=0
+if systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
+    systemctl enable systemd-resolved.service >/dev/null 2>&1 || true
+    log "enabled systemd-resolved"
+    RESOLVED=1
+else
+    log "systemd-resolved is not in this image; the manager's resolvectl" \
+        "actions will fall back to reading /etc/resolv.conf"
+fi
+
+# --- 3. NetworkManager hands DNS to resolved, and keeps off resolv.conf ------
+
+# `dns=systemd-resolved` makes NM push the lease's DNS servers into resolved
+# instead of trying to write them into resolv.conf itself.
+#
+# `rc-manager=unmanaged` is the half that was missing. By default NM MANAGES
+# /etc/resolv.conf - it writes it, or replaces it with a symlink, on every
+# connection change. That is a second writer racing the boot script below, and
+# whichever loses leaves the machine with a resolv.conf the other did not mean.
+# Told `unmanaged`, NM leaves the file entirely alone and the boot script owns
+# it. Written only when resolved is present, since the first line names a
+# backend that would otherwise not exist.
+if [ "$RESOLVED" -eq 1 ]; then
+    install -d /etc/NetworkManager/conf.d
+    cat > /etc/NetworkManager/conf.d/90-gnuchan-dns.conf <<'EOF'
+# GnuchanOS - NetworkManager gives its DNS servers to systemd-resolved and does
+# NOT touch /etc/resolv.conf itself. See 0070-network.hook.chroot.
+[main]
+dns=systemd-resolved
+rc-manager=unmanaged
+EOF
+    chmod 0644 /etc/NetworkManager/conf.d/90-gnuchan-dns.conf
+    log "wrote /etc/NetworkManager/conf.d/90-gnuchan-dns.conf"
+fi
+
+# --- 3b. the resolver's own settings ----------------------------------------
+
+if [ "$RESOLVED" -eq 1 ]; then
+    install -d /etc/systemd/resolved.conf.d
+    cat > /etc/systemd/resolved.conf.d/90-gnuchan.conf <<'EOF'
+# GnuchanOS - a resolver that answers even when the link's own does not.
+# See 0070-network.hook.chroot.
+#
+# FallbackDNS is used only when the servers the connection offered give nothing,
+# so a working DHCP resolver is still preferred. The `#name` after each address
+# is the TLS server name used to validate it; it is what lets the lookup be
+# encrypted rather than sent in the clear.
+#
+# DNS and Domains=~. ARE THE FIX FOR THE ISME-GÖRE BLOCK, and this is the part
+# that actually matters. The symptom that proved it: `ping google.com` resolves
+# and `ping discord.com` answers "Temporary failure in name resolution". A
+# resolver that answers one name and refuses another is not broken - it is
+# BLOCKING BY NAME. The ISP's own DNS server refuses to answer discord.com, and
+# nothing done to packets (zapret, nfqws) can help: the name is never resolved,
+# so there is no packet to desync. The DNS layer itself has to be moved, and
+# section 7 moves it.
+#
+# FallbackDNS alone does NOT fix this: it is used only when the link's own server
+# gives NOTHING, and a server that answers google and refuses discord is still
+# "giving something", so the fallback is never tried. The server is FORCED
+# instead:
+#
+#   DNS=            the server to ask, named explicitly so the ISP's DHCP server
+#                   is not the one asked.
+#   Domains=~.      makes it the server for EVERY name (the `~.` routing domain),
+#                   so the ISP's resolver is never consulted at all.
+#
+# DNSOverTLS is left OFF on purpose: it is one way to slip past the
+# interception, and section 7 takes the other - the NON-STANDARD PORT the
+# Turkish GoodbyeDPI fork uses. Running both at once would point the two halves
+# at different servers, and the port shift is the one that fits these networks.
+[Resolve]
+DNSStubListener=yes
+DNS=77.88.8.8
+Domains=~.
+DNSSEC=allow-downgrade
+FallbackDNS=77.88.8.8
+EOF
+    chmod 0644 /etc/systemd/resolved.conf.d/90-gnuchan.conf
+    log "wrote /etc/systemd/resolved.conf.d/90-gnuchan.conf"
+fi
+
+# --- 4. the boot-time resolv.conf, made to actually happen -------------------
+
+install -d /usr/local/sbin
+
+cat > /usr/local/sbin/gnuchan-resolvconf <<'RESOLVCONF_SCRIPT'
+#!/bin/sh
+# gnuchan-resolvconf - leave /etc/resolv.conf pointing at a resolver that
+# answers. Run at boot by gnuchan-resolvconf.service.
+#
+# IT WAITS FOR THE STUB, which is the whole correction. systemd-resolved creates
+# /run/systemd/resolve/stub-resolv.conf a moment after it starts, and the unit
+# that calls this is scheduled by systemd - it can run a beat early. The earlier
+# version tested once, found nothing, and returned with /etc/resolv.conf still
+# holding the build machine's nameserver: a live boot asking an address that
+# does not exist on the person's network. Waiting closes that window.
+#
+# AND IF THE STUB NEVER COMES UP - resolved disabled, failed, or not in this
+# image - a resolver that WORKS is written in its place instead of leaving a
+# dead one. Falling back to a dead file was the bug; falling back to a live
+# resolver is the fix.
+set -u
+
+STUB=/run/systemd/resolve/stub-resolv.conf
+FALLBACK=/usr/local/share/gnuchan-resolv.conf.fallback
+
+say() { printf 'gnuchan-resolvconf: %s\n' "$1"; }
+
+# Wait for the stub, up to about 15 seconds. It is created almost at once when
+# resolved is running; the wait only ever matters when it is not.
+write_fallback() {
+    # A plain file, not a symlink. `cp -f src /etc/resolv.conf` when resolv.conf
+    # is a symlink to the resolved stub writes THROUGH the link and into
+    # /run/systemd/resolve/stub-resolv.conf - corrupting resolved's own file
+    # instead of replacing the pointer to it. Unlinking first makes this a real
+    # file in its own right, which is what a fallback resolver has to be.
+    rm -f /etc/resolv.conf
+    if [ -e "$FALLBACK" ]; then
+        cp -f "$FALLBACK" /etc/resolv.conf
+    #else
+    #    printf '%s\n' \
+    #        'nameserver 1.1.1.1' \
+    #        'nameserver 8.8.8.8' \
+    #        'nameserver 9.9.9.9' \
+    #        'nameserver 8.8.4.4' > /etc/resolv.conf
+    fi
+}
+
+tries=0
+while [ ! -e "$STUB" ] && [ "$tries" -lt 30 ]; do
+    sleep 0.5
+    tries=$((tries + 1))
+done
+
+# No stub at all: write a resolver that answers rather than leave a dead one.
+if [ ! -e "$STUB" ]; then
+    say "no systemd-resolved stub; writing a fallback resolver"
+    write_fallback
+    exit 0
+fi
+
+# Keep a plain file aside once, so whatever the image shipped is recoverable.
+if [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ] && \
+   [ ! -e /etc/resolv.conf.gnuchan-backup ]; then
+    cp -f /etc/resolv.conf /etc/resolv.conf.gnuchan-backup 2>/dev/null || true
+fi
+rm -f /etc/resolv.conf
+ln -s "$STUB" /etc/resolv.conf
+
+# POINTING AT THE STUB IS NOT THE SAME AS THE STUB ANSWERING, and the earlier
+# versions of this script stopped at the symlink. A stub that is listening but
+# has no upstream - which is what resolved looks like when NetworkManager has
+# not handed it the lease's servers yet, or handed it an address the network
+# refuses - reads to every program as "the network is down". That is the exact
+# failure being fixed, so the resolver is ASKED rather than assumed. `getent
+# hosts` goes through the C library and /etc/resolv.conf the way ping and every
+# other program do, so a lookup that succeeds here is a lookup that will
+# succeed for them.
+answers=1
+if command -v timeout >/dev/null 2>&1; then
+    timeout 5 getent hosts one.one.one.one >/dev/null 2>&1 || answers=0
+else
+    getent hosts one.one.one.one >/dev/null 2>&1 || answers=0
+fi
+
+if [ "$answers" -eq 1 ]; then
+    say "resolv.conf -> $STUB (systemd-resolved, answering)"
+    exit 0
+fi
+
+# The stub is there but does not resolve. Leaving the symlink would leave the
+# machine unable to look anything up, so the resolver is replaced with one that
+# does answer.
+say "the resolved stub did not answer; writing a fallback resolver"
+write_fallback
+exit 0
+RESOLVCONF_SCRIPT
+chmod 0755 /usr/local/sbin/gnuchan-resolvconf
+log "wrote /usr/local/sbin/gnuchan-resolvconf"
+
+# The fallback file the script copies from, written here so it is one definition
+# rather than two inline lists that can drift.
+install -d /usr/local/share
+cat > /usr/local/share/gnuchan-resolv.conf.fallback <<'EOF'
+# GnuchanOS - the resolver used when systemd-resolved is not serving its stub.
+# Written by gnuchan-resolvconf; see 0070-network.hook.chroot.
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+nameserver 8.8.4.4
+EOF
+chmod 0644 /usr/local/share/gnuchan-resolv.conf.fallback
+
+cat > /etc/systemd/system/gnuchan-resolvconf.service <<'UNIT_FILE'
+[Unit]
+Description=Point /etc/resolv.conf at a resolver that answers
+# resolved creates the stub on /run; ordering after it means the file is usually
+# there already - and gnuchan-resolvconf WAITS for it regardless, so a beat
+# early is no longer a failure. The ordering is kept for the common case (the
+# file is there before the script looks), and the wait covers the rest.
+#
+# It runs before the manager, so the resolver is in place before a connection
+# is. The dependencies are the ORDINARY ones on purpose: an earlier draft added
+# DefaultDependencies=no to run this "as early as possible", and that is a known
+# way to make a unit start before the things it silently depends on - with the
+# default dependencies off, systemd no longer orders it against sysinit.target,
+# and the script can run in a filesystem that is not assembled yet. The bug was
+# never WHEN this ran; it was what the script did when it arrived.
+# AFTER the network, not before it. The earlier ordering, Before=NetworkManager,
+# is half the bug: it runs against a machine with no connection, when
+# systemd-resolved has no upstream servers yet and a resolver pointed at it can
+# answer nothing - and when the person connects afterwards, this does not run
+# again. Running after the manager means there is a connection to test
+# resolution against. A connection made later still is covered by the
+# NetworkManager dispatcher installed below, which runs on every connect event.
+After=systemd-resolved.service NetworkManager.service network-online.target
+Wants=systemd-resolved.service NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gnuchan-resolvconf
+
+[Install]
+WantedBy=multi-user.target
+UNIT_FILE
+chmod 0644 /etc/systemd/system/gnuchan-resolvconf.service
+log "wrote /etc/systemd/system/gnuchan-resolvconf.service"
+
+if systemctl enable gnuchan-resolvconf.service >/dev/null 2>&1; then
+    log "enabled gnuchan-resolvconf"
+else
+    log "could not enable gnuchan-resolvconf now; it is still installed"
+fi
+
+# --- 4b. the dispatcher: run the same script on every connection -------------
+
+# THIS IS THE PART THAT FIXES THE REPORTED FAILURE, and without it the unit
+# above is not enough. The unit runs once, at boot. On a live system the link is
+# usually brought up a moment AFTER boot - the person plugs in the cable or
+# picks a wireless network from the desktop - so by the time there is a network
+# to resolve against, the one-shot unit has already run and gone. What it left
+# behind was decided before any connection existed.
+#
+# NetworkManager runs every executable in /etc/NetworkManager/dispatcher.d/
+# whenever an interface changes state, AFTER it has taken the lease and (with
+# dns=systemd-resolved above) pushed the lease's servers into systemd-resolved.
+# So the dispatcher runs at exactly the moment a resolver is finally worth
+# pointing at, and calls the SAME script the unit does - one definition of "point
+# resolv.conf at something that answers", two entry points.
+#
+# It is called as `<script> <interface> <event>`; only `up` and
+# `connectivity-change` mean DNS may now be reachable. `down` is deliberately
+# not handled with a fallback write: dropping one link while another is up must
+# not replace a working resolver, and a real change is followed by an event that
+# corrects the file anyway.
+#
+# NetworkManager ignores a dispatcher script that is not owned by root and
+# executable; both are set. The directory is a drop-in NM reads without config.
+if [ "$RESOLVED" -eq 1 ]; then
+    install -d /etc/NetworkManager/dispatcher.d
+    cat > /etc/NetworkManager/dispatcher.d/90-gnuchan-resolvconf <<'DISPATCHER'
+#!/bin/sh
+# GnuchanOS - keep /etc/resolv.conf pointing at a resolver that answers, each
+# time a connection comes up. See 0070-network.hook.chroot.
+#
+# NetworkManager calls this as: <script> <interface> <event>. Only the event is
+# read; the resolver is global, not per-interface.
+set -u
+
+case "${2:-}" in
+    up|connectivity-change)
+        /usr/local/sbin/gnuchan-resolvconf
+        ;;
+    *)
+        :
+        ;;
+esac
+
+exit 0
+DISPATCHER
+    chmod 0755 /etc/NetworkManager/dispatcher.d/90-gnuchan-resolvconf
+    chown root:root /etc/NetworkManager/dispatcher.d/90-gnuchan-resolvconf 2>/dev/null || true
+    log "wrote /etc/NetworkManager/dispatcher.d/90-gnuchan-resolvconf"
+fi
+
+# --- 5. a safety net for the build with no resolved at all -------------------
+
+# If resolved is not in the image, nothing above put a resolver in place and the
+# image would resolve nothing. A plain, working resolv.conf is written for that
+# case. When resolved IS present the boot script replaces this with the stub
+# symlink, which is the better setup.
+if [ "$RESOLVED" -eq 0 ]; then
+    rm -f /etc/resolv.conf
+    cat > /etc/resolv.conf <<'EOF'
+# GnuchanOS - no systemd-resolved in this image, so a resolver is named here.
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+nameserver 8.8.4.4
+EOF
+    log "wrote a static /etc/resolv.conf (no resolved in this image)"
+fi
+
+# --- 6. zapret, so the manager's DPI button has something to run -------------
+
+# The DPI button runs /opt/zapret/init.d/sysv/zapret (see the manager's net_dpi.c
+# and its DpiInitPath). zapret is not a Debian package, so it is fetched and
+# unpacked here or the button runs a script that does not exist - which on the
+# live system is a DPI feature that does nothing.
+#
+# The manager's own makefile.py installs zapret too, and that is what an
+# installed MACHINE should use: it runs zapret's blockcheck to choose the desync
+# that works on that network. It is NOT reliable for the IMAGE build - blockcheck
+# needs a live network and install_easy.sh is interactive, so the step can fail
+# silently and the image ships with no /opt/zapret. This puts the tree and the
+# binaries in place deterministically, leaving blockcheck to the manager.
+#
+# A build host with no network reports and carries on, as the other fetches do.
+ZAPRET_VERSION="72.13"
+ZAPRET_DIR="/opt/zapret"
+
+if [ -x "$ZAPRET_DIR/init.d/sysv/zapret" ]; then
+    log "zapret is already installed under $ZAPRET_DIR"
+else
+    log "installing zapret (the DPI bypass the manager's DPI button runs)"
+
+    # The firewall tools nfqws sits behind. The manager's own makefile would
+    # apt-install these, but it SKIPS its whole zapret step when /opt/zapret is
+    # already there - and this hook is what put it there - so they are named
+    # here or they would be missing on a machine where nothing else pulls them
+    # in. nftables and iptables are the two back ends zapret's setup chooses
+    # between; both are installed so the init script works whichever it picks.
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            nftables iptables >/dev/null 2>&1 || \
+            log "the firewall tools could not be installed; the bypass may not" \
+                "reach the packet path until they are"
+    fi
+
+    zapret_work=$(mktemp -d)
+    zapret_tar="$zapret_work/zapret.tar.gz"
+    zapret_url="https://github.com/bol-van/zapret/releases/download/v$ZAPRET_VERSION/zapret-v$ZAPRET_VERSION.tar.gz"
+
+    got=0
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -O "$zapret_tar" "$zapret_url" && got=1 || true
+    fi
+    if [ "$got" -eq 0 ] && command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$zapret_tar" "$zapret_url" && got=1 || true
+    fi
+
+    if [ "$got" -eq 1 ] && [ -s "$zapret_tar" ]; then
+        tar -xzf "$zapret_tar" -C "$zapret_work" || true
+        zapret_src="$zapret_work/zapret-v$ZAPRET_VERSION"
+        if [ -d "$zapret_src" ]; then
+            rm -rf "$ZAPRET_DIR"
+            cp -a "$zapret_src" "$ZAPRET_DIR"
+
+            # The binaries and their prerequisites, non-interactively. The
+            # INTERACTIVE installer is not run: it asks about the firewall and
+            # picks a desync by testing the network, neither of which a chroot
+            # can answer. The settings it would write are forced below.
+            ( cd "$ZAPRET_DIR" && sh ./install_prereq.sh </dev/null >/dev/null 2>&1 ) || true
+            ( cd "$ZAPRET_DIR" && sh ./install_bin.sh >/dev/null 2>&1 ) || true
+
+            # THE CONFIG FILE HAS TO EXIST AND BE COMPLETE, or nfqws starts and
+            # does nothing. The init script sources `config`
+            # (ZAPRET_CONFIG="$ZAPRET_RW/config" in init.d/sysv/functions). The
+            # reference tree ships `config.default`, and it is `install_easy.sh` -
+            # interactive, and NOT run above, since it asks about the firewall
+            # and picks a desync by testing the network - that copies it across.
+            # Without the copy there is no `config` at all, and the sed below
+            # guarding on `[ -f .../config ]` silently does nothing: the image
+            # ships with no config, nfqws is started with none of its ports, no
+            # packet is queued to it, and the bypass does nothing. On the live
+            # system that is exactly a blocked site still resetting.
+            if [ ! -f "$ZAPRET_DIR/config" ] && [ -f "$ZAPRET_DIR/config.default" ]; then
+                cp -f "$ZAPRET_DIR/config.default" "$ZAPRET_DIR/config"
+            fi
+
+            # NFQWS_ENABLE=1 is the switch for the whole feature: config.default
+            # ships 0, which makes the init script launch no daemon and the
+            # button look dead. MODE_FILTER=none sends every redirected
+            # connection through the daemon, the "blocked sites open everywhere"
+            # the button promises.
+            if [ -f "$ZAPRET_DIR/config" ]; then
+                sed -i 's/^NFQWS_ENABLE=.*/NFQWS_ENABLE=1/' "$ZAPRET_DIR/config" || true
+                grep -q '^NFQWS_ENABLE=' "$ZAPRET_DIR/config" || \
+                    printf 'NFQWS_ENABLE=1\n' >> "$ZAPRET_DIR/config"
+                sed -i 's/^MODE_FILTER=.*/MODE_FILTER=none/' "$ZAPRET_DIR/config" || true
+
+                # NFQWS_PORTS_TCP / NFQWS_PORTS_UDP are the PORTS nfqws is fed.
+                # They are the line that makes the SNI block get handled at all:
+                # the `--filter-tcp=443` inside NFQWS_OPT below says WHAT to do
+                # to a port-443 packet, and these say WHICH packets reach nfqws.
+                # config.default sets 80,443 and 443, which is what the bypass
+                # needs; they are asserted so a config that reached here without
+                # them cannot silently feed the daemon nothing.
+                sed -i 's/^NFQWS_PORTS_TCP=.*/NFQWS_PORTS_TCP=80,443/' "$ZAPRET_DIR/config" || true
+                grep -q '^NFQWS_PORTS_TCP=' "$ZAPRET_DIR/config" || \
+                    printf 'NFQWS_PORTS_TCP=80,443\n' >> "$ZAPRET_DIR/config"
+                sed -i 's/^NFQWS_PORTS_UDP=.*/NFQWS_PORTS_UDP=443/' "$ZAPRET_DIR/config" || true
+                grep -q '^NFQWS_PORTS_UDP=' "$ZAPRET_DIR/config" || \
+                    printf 'NFQWS_PORTS_UDP=443\n' >> "$ZAPRET_DIR/config"
+
+                # INIT_APPLY_FW is the switch that lets zapret's init script
+                # install its OWN firewall rules - the ones that hand a packet
+                # to nfqws. Without it `zapret start` runs the daemon and skips
+                # zapret_apply_firewall entirely (init.d/sysv/zapret:
+                # "[ "$INIT_APPLY_FW" != "1" ] || zapret_apply_firewall"), so
+                # the daemon sits there receiving nothing and the bypass does
+                # nothing at all. It is asserted here as well as in the 0360
+                # hook, because this block is what puts zapret on the image and
+                # GnuChanNetworkManager's makefile REWRITES the config with its
+                # own answers afterwards; 0360 then runs last and forces every
+                # one of these again, so the final file is right whichever
+                # writer was last.
+                sed -i 's/^INIT_APPLY_FW=.*/INIT_APPLY_FW=1/' "$ZAPRET_DIR/config" || true
+                grep -q '^INIT_APPLY_FW=' "$ZAPRET_DIR/config" || \
+                    printf 'INIT_APPLY_FW=1\n' >> "$ZAPRET_DIR/config"
+
+                # NFQWS_OPT is the desync ITSELF - the flags nfqws runs with.
+                # config.default already carries a full working set (one method
+                # for 80, one for 443, one for udp/443), and they are KEPT rather
+                # than overwritten: the default pair - fake+multisplit on 80,
+                # fake+multidisorder with badseq,md5sig fooling on 443 - is what
+                # the reference installer ships because it clears the common
+                # filters, and replacing it with one invented line only ever
+                # breaks more networks than it fixes. The method a GIVEN network
+                # needs is chosen by blockcheck on the real machine, which the
+                # manager runs there. This only writes a fallback if the copied
+                # config somehow carried no NFQWS_OPT at all.
+                if ! grep -q '^NFQWS_OPT=' "$ZAPRET_DIR/config"; then
+                    printf '%s\n' \
+                        'NFQWS_OPT="--filter-tcp=80 --dpi-desync=fake,multisplit --dpi-desync-split-pos=method+2 --dpi-desync-fooling=md5sig --new --filter-tcp=443 --dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld --dpi-desync-fooling=badseq,md5sig --new --filter-udp=443 --dpi-desync=fake --dpi-desync-repeats=6"' \
+                        >> "$ZAPRET_DIR/config"
+                fi
+            fi
+
+            if [ -f "$ZAPRET_DIR/init.d/systemd/zapret.service" ]; then
+                cp -f "$ZAPRET_DIR/init.d/systemd/zapret.service" \
+                    /etc/systemd/system/zapret.service
+                systemctl enable zapret >/dev/null 2>&1 || true
+            fi
+            log "installed zapret under $ZAPRET_DIR"
+        else
+            log "the zapret archive did not contain zapret-v$ZAPRET_VERSION"
+        fi
+    else
+        log "zapret could not be downloaded; the DPI button will report that no" \
+            "bypass is installed until it is fetched on the machine"
+    fi
+    rm -rf "$zapret_work"
+fi
+
+# --- 7. the DNS half of the bypass -------------------------------------------
+
+# THIS IS A SECOND, SEPARATE BLOCK, and it is the one that was missing. Section
+# 6's zapret fragments the TLS name on port 443, which is the block that resets
+# a connection. This is the block that refuses the NAME, and it happens on port
+# 53 - or does not happen at all. The two look different to the person: the SNI
+# block gives a connection that hangs or resets, and this one gives
+#
+#     ping: discord.com: Temporary failure in name resolution
+#
+# while `ping google.com` works. A name that never resolves cannot be fixed by
+# fragmenting packets, because there is no packet to fragment yet. The DNS layer
+# has to be moved, and zapret does not move it - its own config.default covers
+#
+#     NFQWS_PORTS_TCP=80,443
+#     NFQWS_PORTS_UDP=443
+#
+# and nothing on port 53.
+#
+# The Turkish GoodbyeDPI fork solves exactly this, and says how in its command
+# line:
+#
+#     goodbyedpi.exe -5 --set-ttl 5 --dns-addr 77.88.8.8 --dns-port 1253 ...
+#
+# A public resolver is reached on a NON-STANDARD PORT. The interception watches
+# port 53; a query on 1253 is not seen, reaches the resolver untouched, and the
+# name is answered. This is the Linux equivalent written as a NAT rule, sending
+# outgoing DNS to 77.88.8.8:1253.
+#
+# Loopback is exempt, and that is the important guard: every program asks the
+# local resolver stub on 127.0.0.53, and redirecting THAT into the rule would
+# send the stub's own query to Yandex and let it ask nothing. The exemption is
+# the first rule in both back ends, and the redirect is only added when the
+# exemption is in place.
+#
+# nftables is preferred and iptables is the fallback, the same pair section 6
+# installs. The address is Yandex's because it is the one the reference fork uses
+# and the one known to answer on 1253; changing it is the SERVER line below.
+install -d /usr/local/sbin
+
+cat > /usr/local/sbin/gnuchan-dnsredir <<'DNSREDIR_SCRIPT'
+#!/bin/sh
+# gnuchan-dnsredir - send outgoing DNS to a resolver on a non-standard port, so
+# an interception watching port 53 never sees it. See 0070-network.hook.chroot.
+set -u
+
+SERVER=77.88.8.8
+PORT=1253
+
+say() { printf 'gnuchan-dnsredir: %s\n' "$1"; }
+
+applied=0
+
+# nftables first.
+if command -v nft >/dev/null 2>&1; then
+    nft delete table ip gnuchan_dns >/dev/null 2>&1 || true
+    if nft add table ip gnuchan_dns >/dev/null 2>&1 &&
+       nft 'add chain ip gnuchan_dns out { type nat hook output priority -100; }' >/dev/null 2>&1 &&
+       nft add rule ip gnuchan_dns out oif lo return >/dev/null 2>&1 &&
+       nft add rule ip gnuchan_dns out udp dport 53 counter dnat to "$SERVER:$PORT" >/dev/null 2>&1 &&
+       nft add rule ip gnuchan_dns out tcp dport 53 counter dnat to "$SERVER:$PORT" >/dev/null 2>&1; then
+        say "outgoing DNS -> $SERVER:$PORT (nftables)"
+        applied=1
+    fi
+fi
+
+# iptables otherwise. The loopback rule is added first and the redirect is added
+# only if it is there, so a failure cannot leave the stub redirected into itself.
+if [ "$applied" -eq 0 ] && command -v iptables >/dev/null 2>&1; then
+    if iptables -t nat -C OUTPUT -o lo -j RETURN >/dev/null 2>&1 ||
+       iptables -t nat -A OUTPUT -o lo -j RETURN >/dev/null 2>&1; then
+        iptables -t nat -C OUTPUT -p udp --dport 53 -j DNAT --to-destination "$SERVER:$PORT" >/dev/null 2>&1 ||
+            iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination "$SERVER:$PORT" >/dev/null 2>&1 || true
+        iptables -t nat -C OUTPUT -p tcp --dport 53 -j DNAT --to-destination "$SERVER:$PORT" >/dev/null 2>&1 ||
+            iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination "$SERVER:$PORT" >/dev/null 2>&1 || true
+        say "outgoing DNS -> $SERVER:$PORT (iptables)"
+        applied=1
+    fi
+fi
+
+if [ "$applied" -eq 0 ]; then
+    say "no firewall tool could take the rule; DNS was left as it was"
+fi
+
+exit 0
+DNSREDIR_SCRIPT
+chmod 0755 /usr/local/sbin/gnuchan-dnsredir
+log "wrote /usr/local/sbin/gnuchan-dnsredir"
+
+cat > /etc/systemd/system/gnuchan-dnsredir.service <<'DNSREDIR_UNIT'
+[Unit]
+Description=Send outgoing DNS to a resolver on a non-standard port
+# After the network, so there is an interface to install the rule on. It runs
+# before the unit that points resolv.conf at the stub, so the redirect is in
+# place by the time anything resolves.
+After=network-online.target
+Wants=network-online.target
+Before=gnuchan-resolvconf.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gnuchan-dnsredir
+
+[Install]
+WantedBy=multi-user.target
+DNSREDIR_UNIT
+chmod 0644 /etc/systemd/system/gnuchan-dnsredir.service
+log "wrote /etc/systemd/system/gnuchan-dnsredir.service"
+
+if systemctl enable gnuchan-dnsredir.service >/dev/null 2>&1; then
+    log "enabled gnuchan-dnsredir"
+else
+    log "could not enable gnuchan-dnsredir now; it is still installed"
+fi
+
+log "done"
