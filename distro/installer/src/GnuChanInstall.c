@@ -58,7 +58,7 @@ static void build_fields(InstApp *app) {
         { "Password",         INST_FIELD_SECRET, ""           },
         { "Password again",   INST_FIELD_SECRET, ""           },
         { "Computer name",    INST_FIELD_PLAIN,  "gnuchan"    },
-        { "Swap type (click to cycle)", INST_FIELD_CHOICE, "off" },
+        { "Swap",             INST_FIELD_CHOICE, "off"        },
     };
     app->field_count = (int)(sizeof(spec) / sizeof(spec[0]));
     for (int i = 0; i < app->field_count; i++) {
@@ -72,19 +72,9 @@ static void build_fields(InstApp *app) {
     app->field_active = 1;     /* the login name, the first thing to type */
 }
 
-void inst_cycle_choice(InstField *field) {
-    static const char *const modes[] = {
-        "off", "swapfile", "partition", "zram", "zswap"
-    };
-    int count = (int)(sizeof(modes) / sizeof(modes[0]));
-    int choice = 0;
-    while (choice < count - 1 && strcmp(field->text, modes[choice]) != 0) {
-        choice++;
-    }
-    choice = (choice + 1) % count;
-    snprintf(field->text, sizeof(field->text), "%s", modes[choice]);
-    field->length = (int)strlen(field->text);
-}
+const char *const inst_swap_options[INST_SWAP_OPTION_COUNT] = {
+    "off", "swapfile", "partition", "zram", "zswap"
+};
 
 /* --- the keyboard ---------------------------------------------------------- */
 
@@ -123,6 +113,37 @@ static void handle_key(InstApp *app, XKeyEvent *event) {
                      app->disks[app->disk_choice].description);
             app->fields[0].length = (int)strlen(app->fields[0].text);
             app->disk_dropdown_open = 0;
+            app->field_active = 0;
+            inst_layout(app);
+        }
+        inst_draw(app);
+        return;
+    }
+    if (app->swap_dropdown_open) {
+        char buffer[32];
+        KeySym keysym = NoSymbol;
+        XLookupString(event, buffer, sizeof(buffer), &keysym, NULL);
+        if (keysym == XK_Escape) {
+            app->swap_dropdown_open = 0;
+            inst_layout(app);
+        } else if (keysym == XK_Up || keysym == XK_Down) {
+            int step = keysym == XK_Up ? -1 : 1;
+            app->swap_dropdown_cursor =
+                (app->swap_dropdown_cursor + step + INST_SWAP_OPTION_COUNT) %
+                INST_SWAP_OPTION_COUNT;
+            if (app->swap_dropdown_cursor < app->swap_dropdown_scroll) {
+                app->swap_dropdown_scroll = app->swap_dropdown_cursor;
+            } else if (app->swap_dropdown_cursor >=
+                       app->swap_dropdown_scroll + INST_SWAP_DROPDOWN_ROWS) {
+                app->swap_dropdown_scroll =
+                    app->swap_dropdown_cursor - INST_SWAP_DROPDOWN_ROWS + 1;
+            }
+        } else if (keysym == XK_Return || keysym == XK_KP_Enter) {
+            InstField *field = &app->fields[6];
+            snprintf(field->text, sizeof(field->text), "%s",
+                     inst_swap_options[app->swap_dropdown_cursor]);
+            field->length = (int)strlen(field->text);
+            app->swap_dropdown_open = 0;
             app->field_active = 0;
             inst_layout(app);
         }
@@ -181,11 +202,25 @@ static void handle_key(InstApp *app, XKeyEvent *event) {
         return;
     }
 
+    if ((keysym == XK_Return || keysym == XK_KP_Enter) &&
+        field->kind == INST_FIELD_CHOICE) {
+        app->swap_dropdown_open = 1;
+        app->swap_dropdown_cursor = 0;
+        for (int i = 0; i < INST_SWAP_OPTION_COUNT; i++) {
+            if (strcmp(field->text, inst_swap_options[i]) == 0) {
+                app->swap_dropdown_cursor = i;
+                break;
+            }
+        }
+        app->swap_dropdown_scroll =
+            app->swap_dropdown_cursor >= INST_SWAP_DROPDOWN_ROWS
+                ? app->swap_dropdown_cursor - INST_SWAP_DROPDOWN_ROWS + 1 : 0;
+        inst_layout(app);
+        inst_draw(app);
+        return;
+    }
     if (keysym == XK_Return || keysym == XK_KP_Enter ||
         keysym == XK_Tab) {
-        if (field->kind == INST_FIELD_CHOICE) {
-            inst_cycle_choice(field);
-        }
         /* move to the next answer, so a person can type without the mouse */
         app->field_active = (index + 1 < app->field_count) ? index + 1 : 0;
         if (app->field_active == 0) {
@@ -366,26 +401,33 @@ static int run(InstApp *app) {
                 inst_pointer_motion(app, event.xmotion.x, event.xmotion.y);
                 break;
             case ButtonPress:
-                if (app->disk_dropdown_open &&
+                if ((app->disk_dropdown_open || app->swap_dropdown_open) &&
                     (event.xbutton.button == Button4 ||
                      event.xbutton.button == Button5)) {
-                    int max_scroll = app->disk_count - INST_DISK_DROPDOWN_ROWS;
+                    int swap_open = app->swap_dropdown_open;
+                    int count = swap_open ? INST_SWAP_OPTION_COUNT
+                                          : app->disk_count;
+                    int rows = swap_open ? INST_SWAP_DROPDOWN_ROWS
+                                         : INST_DISK_DROPDOWN_ROWS;
+                    int *scroll = swap_open ? &app->swap_dropdown_scroll
+                                            : &app->disk_dropdown_scroll;
+                    int *cursor = swap_open ? &app->swap_dropdown_cursor
+                                            : &app->disk_dropdown_cursor;
+                    int max_scroll = count - rows;
                     if (max_scroll < 0) {
                         max_scroll = 0;
                     }
-                    app->disk_dropdown_scroll +=
+                    *scroll +=
                         event.xbutton.button == Button4 ? -1 : 1;
-                    if (app->disk_dropdown_scroll < 0) {
-                        app->disk_dropdown_scroll = 0;
-                    } else if (app->disk_dropdown_scroll > max_scroll) {
-                        app->disk_dropdown_scroll = max_scroll;
+                    if (*scroll < 0) {
+                        *scroll = 0;
+                    } else if (*scroll > max_scroll) {
+                        *scroll = max_scroll;
                     }
-                    if (app->disk_dropdown_cursor < app->disk_dropdown_scroll) {
-                        app->disk_dropdown_cursor = app->disk_dropdown_scroll;
-                    } else if (app->disk_dropdown_cursor >=
-                               app->disk_dropdown_scroll + INST_DISK_DROPDOWN_ROWS) {
-                        app->disk_dropdown_cursor =
-                            app->disk_dropdown_scroll + INST_DISK_DROPDOWN_ROWS - 1;
+                    if (*cursor < *scroll) {
+                        *cursor = *scroll;
+                    } else if (*cursor >= *scroll + rows) {
+                        *cursor = *scroll + rows - 1;
                     }
                     inst_draw(app);
                 } else if (event.xbutton.button == Button1) {

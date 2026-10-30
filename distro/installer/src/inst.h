@@ -47,6 +47,8 @@
 #define INST_OUTPUT_WIDTH 512
 #define INST_MAX_DISKS 16
 #define INST_DISK_DROPDOWN_ROWS 4
+#define INST_SWAP_OPTION_COUNT 5
+#define INST_SWAP_DROPDOWN_ROWS 4
 
 /* --- the colours the window is drawn in ----------------------------------- */
 
@@ -68,7 +70,7 @@ typedef struct InstColours {
 typedef enum InstFieldKind {
     INST_FIELD_PLAIN,     /* ordinary text (login name, host name)            */
     INST_FIELD_SECRET,    /* shown as dots (the password and its repeat)      */
-    INST_FIELD_CHOICE     /* click or Enter to cycle fixed options            */
+    INST_FIELD_CHOICE     /* click or Enter to select a fixed option          */
 } InstFieldKind;
 
 typedef struct InstField {
@@ -109,6 +111,9 @@ typedef struct InstApp {
     int disk_dropdown_open;
     int disk_dropdown_cursor;
     int disk_dropdown_scroll;
+    int swap_dropdown_open;
+    int swap_dropdown_cursor;
+    int swap_dropdown_scroll;
 
     /* the fields, and which one has the keyboard (-1 = none) */
     InstField fields[INST_MAX_FIELDS];
@@ -183,7 +188,7 @@ int inst_validate(InstApp *app);
 
 /* Which field the pointer is over, or the button, for the hover highlight. */
 void inst_pointer_motion(InstApp *app, int x, int y);
-void inst_cycle_choice(InstField *field);
+extern const char *const inst_swap_options[INST_SWAP_OPTION_COUNT];
 /* A click: choose a disk, focus a field, or press the button. Starts the
    install when the button is pressed and the answers are valid. */
 void inst_button_press(InstApp *app, int x, int y);

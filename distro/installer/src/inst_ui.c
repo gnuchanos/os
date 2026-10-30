@@ -90,6 +90,8 @@ void inst_layout(InstApp *app) {
     int field_h = app->font->ascent + app->font->descent + 14;
     int dropdown_rows = app->disk_count < INST_DISK_DROPDOWN_ROWS
         ? app->disk_count : INST_DISK_DROPDOWN_ROWS;
+    int swap_dropdown_rows = INST_SWAP_OPTION_COUNT < INST_SWAP_DROPDOWN_ROWS
+        ? INST_SWAP_OPTION_COUNT : INST_SWAP_DROPDOWN_ROWS;
 
     for (int i = 0; i < app->field_count; i++) {
         InstField *field = &app->fields[i];
@@ -100,6 +102,9 @@ void inst_layout(InstApp *app) {
         row_y += field_h + 12;
         if (i == 0 && app->disk_dropdown_open) {
             row_y += dropdown_rows * field_h + 8;
+        }
+        if (i == 6 && app->swap_dropdown_open) {
+            row_y += swap_dropdown_rows * field_h + 8;
         }
     }
 
@@ -173,8 +178,9 @@ void inst_draw(InstApp *app) {
                 field->label);
 
         /* the box */
-        int active = ((i == app->field_active) || (i == 0 && app->disk_dropdown_open))
-                     && !app->running;
+        int active = ((i == app->field_active) ||
+                      (i == 0 && app->disk_dropdown_open) ||
+                      (i == 6 && app->swap_dropdown_open)) && !app->running;
         XSetForeground(app->display, app->gc,
                        active ? app->colours.field_active.pixel
                               : app->colours.field.pixel);
@@ -200,9 +206,8 @@ void inst_draw(InstApp *app) {
             snprintf(shown, sizeof(shown), "%s", field->text);
         }
         if (field->kind == INST_FIELD_CHOICE) {
-            size_t length = strlen(shown);
-            if (length + 4 < sizeof(shown)) {
-                memcpy(shown + length, "  v", 4);
+            if (strcmp(shown, "off") == 0) {
+                snprintf(shown, sizeof(shown), "%s", "disable");
             }
         }
         int text_baseline = field->box_y +
@@ -210,7 +215,7 @@ void inst_draw(InstApp *app) {
         text_at(app, &app->colours.text, app->font,
                 field->box_x + 12, text_baseline, shown);
 
-        if (i == 0) {
+        if (i == 0 || field->kind == INST_FIELD_CHOICE) {
             int arrow_x = field->box_x + field->box_w - 20;
             int arrow_y = field->box_y + field->box_h / 2;
             unsigned long arrow_colour = active
@@ -253,6 +258,48 @@ void inst_draw(InstApp *app) {
             text_at(app, &app->colours.text, app->font,
                     field->box_x + 12, baseline,
                     app->disks[choice].description);
+            if (row + 1 < visible) {
+                XSetForeground(app->display, app->gc,
+                               app->colours.panel_edge.pixel);
+                XDrawLine(app->display, app->buffer, app->gc,
+                          field->box_x + 2, item_y + row_h - 1,
+                          field->box_x + field->box_w - 3,
+                          item_y + row_h - 1);
+            }
+        }
+    }
+
+    if (app->swap_dropdown_open) {
+        InstField *field = &app->fields[6];
+        int row_h = field->box_h;
+        int visible = INST_SWAP_OPTION_COUNT < INST_SWAP_DROPDOWN_ROWS
+            ? INST_SWAP_OPTION_COUNT : INST_SWAP_DROPDOWN_ROWS;
+        int menu_y = field->box_y + field->box_h;
+        int menu_h = visible * row_h;
+        XSetForeground(app->display, app->gc, app->colours.field.pixel);
+        XFillRectangle(app->display, app->buffer, app->gc, field->box_x,
+                       menu_y, (unsigned int)field->box_w,
+                       (unsigned int)menu_h);
+        box_outline(app, app->colours.accent.pixel, field->box_x, menu_y,
+                    field->box_w, menu_h);
+
+        for (int row = 0; row < visible; row++) {
+            int choice = app->swap_dropdown_scroll + row;
+            int item_y = menu_y + row * row_h;
+            if (choice == app->swap_dropdown_cursor) {
+                XSetForeground(app->display, app->gc,
+                               app->colours.field_active.pixel);
+                XFillRectangle(app->display, app->buffer, app->gc,
+                               field->box_x + 2, item_y + 1,
+                               (unsigned int)(field->box_w - 4),
+                               (unsigned int)(row_h - 2));
+            }
+            int baseline = item_y +
+                (row_h + app->font->ascent - app->font->descent) / 2;
+            const char *option = inst_swap_options[choice];
+            text_at(app, &app->colours.text, app->font,
+                    field->box_x + 12, baseline,
+                    strcmp(option, "off") == 0 ? "disable" : option);
             if (row + 1 < visible) {
                 XSetForeground(app->display, app->gc,
                                app->colours.panel_edge.pixel);
@@ -468,6 +515,29 @@ void inst_button_press(InstApp *app, int x, int y) {
         inst_draw(app);
         return;
     }
+    if (app->swap_dropdown_open) {
+        InstField *field = &app->fields[6];
+        int visible = INST_SWAP_OPTION_COUNT < INST_SWAP_DROPDOWN_ROWS
+            ? INST_SWAP_OPTION_COUNT : INST_SWAP_DROPDOWN_ROWS;
+        int menu_y = field->box_y + field->box_h;
+        int menu_bottom = menu_y + visible * field->box_h;
+        if (x >= field->box_x && x < field->box_x + field->box_w &&
+            y >= menu_y && y < menu_bottom) {
+            int row = (y - menu_y) / field->box_h;
+            int choice = app->swap_dropdown_scroll + row;
+            snprintf(field->text, sizeof(field->text), "%s",
+                     inst_swap_options[choice]);
+            field->length = (int)strlen(field->text);
+            app->swap_dropdown_open = 0;
+            app->field_active = 0;
+            inst_layout(app);
+        } else {
+            app->swap_dropdown_open = 0;
+            inst_layout(app);
+        }
+        inst_draw(app);
+        return;
+    }
     if (app->confirming_erase) {
         if (x >= app->erase_box_x && x < app->erase_box_x + app->erase_box_w &&
             y >= app->erase_box_y && y < app->erase_box_y + app->erase_box_h) {
@@ -523,7 +593,22 @@ void inst_button_press(InstApp *app, int x, int y) {
             } else {
                 app->field_active = i;
                 if (field->kind == INST_FIELD_CHOICE) {
-                    inst_cycle_choice(field);
+                    app->swap_dropdown_open = 1;
+                    app->swap_dropdown_cursor = 0;
+                    for (int choice = 0; choice < INST_SWAP_OPTION_COUNT;
+                         choice++) {
+                        if (strcmp(field->text,
+                                   inst_swap_options[choice]) == 0) {
+                            app->swap_dropdown_cursor = choice;
+                            break;
+                        }
+                    }
+                    app->swap_dropdown_scroll =
+                        app->swap_dropdown_cursor >= INST_SWAP_DROPDOWN_ROWS
+                            ? app->swap_dropdown_cursor -
+                                  INST_SWAP_DROPDOWN_ROWS + 1
+                            : 0;
+                    inst_layout(app);
                 }
             }
             inst_draw(app);
